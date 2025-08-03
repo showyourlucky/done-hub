@@ -37,6 +37,7 @@ COPY --from=builder2 /build/done-hub /
 EXPOSE 3000
 WORKDIR /data
 
+RUN chown 10014:10014 /data
 USER 10014
 
 ENTRYPOINT ["/done-hub"]

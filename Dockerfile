@@ -5,14 +5,14 @@ WORKDIR /build
 COPY web/package.json .
 COPY web/yarn.lock .
 
+RUN adduser -u 10014 -S appuser
+USER 10014
+
 RUN yarn --frozen-lockfile
 
 COPY ./web .
 COPY ./VERSION .
 RUN DISABLE_ESLINT_PLUGIN='true' VITE_APP_VERSION=$(cat VERSION) npm run build
-
-RUN adduser -D -u 10014 appuser
-USER 10014
 
 FROM golang:1.24.2 AS builder2
 

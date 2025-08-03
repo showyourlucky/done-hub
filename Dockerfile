@@ -11,6 +11,9 @@ COPY ./web .
 COPY ./VERSION .
 RUN DISABLE_ESLINT_PLUGIN='true' VITE_APP_VERSION=$(cat VERSION) npm run build
 
+RUN adduser -D -u 10014 appuser
+USER appuser
+
 FROM golang:1.24.2 AS builder2
 
 ENV GO111MODULE=on \

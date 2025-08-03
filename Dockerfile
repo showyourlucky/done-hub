@@ -5,9 +5,6 @@ WORKDIR /build
 COPY web/package.json .
 COPY web/yarn.lock .
 
-USER 10014
-
-ENV HOME=/build
 
 RUN yarn --frozen-lockfile
 
@@ -39,4 +36,7 @@ RUN apk update && \
 COPY --from=builder2 /build/done-hub /
 EXPOSE 3000
 WORKDIR /data
+
+USER 10014
+
 ENTRYPOINT ["/done-hub"]

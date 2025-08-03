@@ -7,6 +7,8 @@ COPY web/yarn.lock .
 
 USER 10014
 
+ENV HOME=/build
+
 RUN yarn --frozen-lockfile
 
 COPY ./web .

@@ -5,7 +5,6 @@ WORKDIR /build
 COPY web/package.json .
 COPY web/yarn.lock .
 
-RUN adduser -u 10014 -S appuser
 USER 10014
 
 RUN yarn --frozen-lockfile

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,15 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 		if testModel == "" {
 			return nil, errors.New("请填写测速模型后再试")
 		}
+	}
+
+	// 解析模型名称中的 # 后缀（用于 o1/o3-mini/gpt-5 的 reasoning_effort 等参数）
+	// 例如：gpt-5#low -> gpt-5 (otherArg: low)
+	var otherArg string
+	parts := strings.Split(testModel, "#")
+	if len(parts) > 1 {
+		otherArg = parts[1]
+		testModel = parts[0]
 	}
 
 	channelType := getModelType(testModel)
@@ -69,6 +79,11 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 	provider := providers.GetProvider(channel, c)
 	if provider == nil {
 		return nil, errors.New("channel not implemented")
+	}
+
+	// 设置 otherArg（用于 reasoning_effort 等参数）
+	if otherArg != "" {
+		provider.SetOtherArg(otherArg)
 	}
 
 	newModelName, err := provider.ModelMappingHandler(testModel)
@@ -241,12 +256,12 @@ func testAllChannels(isNotify bool) error {
 		disableThreshold = 10000000 // a impossible value
 	}
 	go func() {
-		var sendMessage string
+		var sb strings.Builder
 		for _, channel := range channels {
 			time.Sleep(config.RequestInterval)
 
 			isChannelEnabled := channel.Status == config.ChannelStatusEnabled
-			sendMessage += fmt.Sprintf("**通道 %s - #%d - %s** : \n\n", utils.EscapeMarkdownText(channel.Name), channel.Id, channel.StatusToStr())
+			sb.WriteString(fmt.Sprintf("**通道 %s - #%d - %s** : \n\n", utils.EscapeMarkdownText(channel.Name), channel.Id, channel.StatusToStr()))
 			tik := time.Now()
 			openaiErr, err := testChannel(channel, "")
 			tok := time.Now()
@@ -254,11 +269,11 @@ func testAllChannels(isNotify bool) error {
 			// 通道为禁用状态，并且还是请求错误 或者 响应时间超过阈值 直接跳过，也不需要更新响应时间。
 			if !isChannelEnabled {
 				if err != nil {
-					sendMessage += fmt.Sprintf("- 测试报错: %s \n\n- 无需改变状态，跳过\n\n", utils.EscapeMarkdownText(err.Error()))
+					sb.WriteString(fmt.Sprintf("- 测试报错: %s \n\n- 无需改变状态，跳过\n\n", utils.EscapeMarkdownText(err.Error())))
 					continue
 				}
 				if milliseconds > disableThreshold {
-					sendMessage += fmt.Sprintf("- 响应时间 %.2fs 超过阈值 %.2fs \n\n- 无需改变状态，跳过\n\n", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0)
+					sb.WriteString(fmt.Sprintf("- 响应时间 %.2fs 超过阈值 %.2fs \n\n- 无需改变状态，跳过\n\n", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0))
 					continue
 				}
 				// 如果已被禁用，但是请求成功，需要判断是否需要恢复
@@ -266,40 +281,42 @@ func testAllChannels(isNotify bool) error {
 				if shouldEnableChannel(err, openaiErr) {
 					if channel.Status == config.ChannelStatusAutoDisabled {
 						EnableChannel(channel.Id, channel.Name, false)
-						sendMessage += "- 已被启用 \n\n"
+						sb.WriteString("- 已被启用 \n\n")
 					} else {
-						sendMessage += "- 手动禁用的通道，不会自动恢复 \n\n"
+						sb.WriteString("- 手动禁用的通道，不会自动恢复 \n\n")
 					}
 				}
 			} else {
 				// 如果通道启用状态，但是返回了错误 或者 响应时间超过阈值，需要判断是否需要禁用
 				if milliseconds > disableThreshold {
 					errMsg := fmt.Sprintf("响应时间 %.2fs 超过阈值 %.2fs ", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0)
-					sendMessage += fmt.Sprintf("- %s \n\n- 禁用\n\n", errMsg)
+					sb.WriteString(fmt.Sprintf("- %s \n\n- 禁用\n\n", errMsg))
 					DisableChannel(channel.Id, channel.Name, errMsg, false)
 					continue
 				}
 
 				if ShouldDisableChannel(channel.Type, openaiErr) {
-					sendMessage += fmt.Sprintf("- 已被禁用，原因：%s\n\n", utils.EscapeMarkdownText(err.Error()))
+					sb.WriteString(fmt.Sprintf("- 已被禁用，原因：%s\n\n", utils.EscapeMarkdownText(err.Error())))
 					DisableChannel(channel.Id, channel.Name, err.Error(), false)
 					continue
 				}
 
 				if err != nil {
-					sendMessage += fmt.Sprintf("- 测试报错: %s \n\n", utils.EscapeMarkdownText(err.Error()))
+					sb.WriteString(fmt.Sprintf("- 测试报错: %s \n\n", utils.EscapeMarkdownText(err.Error())))
 					continue
 				}
 			}
 			channel.UpdateResponseTime(milliseconds)
-			sendMessage += fmt.Sprintf("- 测试完成，耗时 %.2fs\n\n", float64(milliseconds)/1000.0)
+			sb.WriteString(fmt.Sprintf("- 测试完成，耗时 %.2fs\n\n", float64(milliseconds)/1000.0))
 		}
 		testAllChannelsLock.Lock()
 		testAllChannelsRunning = false
 		testAllChannelsLock.Unlock()
 		if isNotify {
-			notify.Send("通道测试完成", sendMessage)
+			notify.Send("通道测试完成", sb.String())
 		}
+		// 测试完成后强制释放内存给操作系统
+		debug.FreeOSMemory()
 	}()
 	return nil
 }

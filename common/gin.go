@@ -5,36 +5,72 @@ import (
 	"done-hub/common/config"
 	"done-hub/common/logger"
 	"done-hub/types"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/go-playground/validator/v10"
 )
 
-func UnmarshalBodyReusable(c *gin.Context, v any) error {
-	requestBody, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		return err
+// readBody 读取请求体并缓存，使用 Content-Length 预分配以减少 growSlice 开销
+func readBody(c *gin.Context) ([]byte, error) {
+	size := c.Request.ContentLength
+	if size <= 0 || size > 100<<20 {
+		size = 512
 	}
-	err = c.Request.Body.Close()
+	buf := bytes.NewBuffer(make([]byte, 0, size))
+	if _, err := buf.ReadFrom(c.Request.Body); err != nil {
+		return nil, err
+	}
+	c.Request.Body.Close()
+	return buf.Bytes(), nil
+}
+
+// ReadBodyRaw 只读取请求体原始 bytes 并缓存到 context，不做 JSON 反序列化
+// 适用于大 payload 场景（如含 base64 图片的 Gemini 请求），避免 json.Unmarshal 对所有字符串的内存分配
+func ReadBodyRaw(c *gin.Context) ([]byte, error) {
+	rawBody, err := readBody(c)
+	if err != nil {
+		return nil, err
+	}
+	c.Set(config.GinRequestBodyKey, rawBody)
+	return rawBody, nil
+}
+
+func UnmarshalBodyReusable(c *gin.Context, v any) error {
+	requestBody, err := readBody(c)
 	if err != nil {
 		return err
 	}
 	c.Set(config.GinRequestBodyKey, requestBody)
 
+	// JSON 请求：直接从 []byte 反序列化，避免创建中间 bytes.Buffer
+	contentType := c.ContentType()
+	if contentType == "" || strings.Contains(contentType, "json") {
+		if err = json.Unmarshal(requestBody, v); err != nil {
+			return err
+		}
+		if err = binding.Validator.ValidateStruct(v); err != nil {
+			if errs, ok := err.(validator.ValidationErrors); ok {
+				return fmt.Errorf("field %s is required", errs[0].Field())
+			}
+			return err
+		}
+		return nil
+	}
+
+	// 非 JSON（multipart、form 等）：回退到 ShouldBind
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
 	err = c.ShouldBind(v)
 	if err != nil {
 		if errs, ok := err.(validator.ValidationErrors); ok {
-			// 返回第一个错误字段的名称
 			return fmt.Errorf("field %s is required", errs[0].Field())
 		}
 		return err
 	}
-
-	// c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
 	return nil
 }
 

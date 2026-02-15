@@ -7,6 +7,7 @@ import (
 	"done-hub/providers/vertexai/category"
 	"done-hub/types"
 	"net/http"
+	"strings"
 )
 
 func (p *VertexAIProvider) CreateGeminiChat(request *gemini.GeminiChatRequest) (*gemini.GeminiChatResponse, *types.OpenAIErrorWithStatusCode) {
@@ -23,12 +24,16 @@ func (p *VertexAIProvider) CreateGeminiChat(request *gemini.GeminiChatRequest) (
 		return nil, openaiErr
 	}
 
-	if len(geminiResponse.Candidates) == 0 {
+	// 检查是否是 countTokens 请求（Vertex AI 版本）
+	isCountTokens := len(geminiResponse.Candidates) == 0 &&
+		(geminiResponse.UsageMetadata != nil || geminiResponse.TotalTokens > 0)
+
+	if !isCountTokens && len(geminiResponse.Candidates) == 0 {
 		return nil, common.StringErrorWrapper("no candidates", "no_candidates", http.StatusInternalServerError)
 	}
 
 	usage := p.GetUsage()
-	*usage = gemini.ConvertOpenAIUsage(geminiResponse.UsageMetadata)
+	*usage = gemini.ConvertOpenAIUsageWithFallback(geminiResponse.UsageMetadata, geminiResponse)
 
 	return geminiResponse, nil
 }
@@ -71,7 +76,8 @@ func (p *VertexAIProvider) getGeminiRequest(request *gemini.GeminiChatRequest) (
 		return nil, common.StringErrorWrapperLocal("vertexAI gemini provider not found", "vertexAI_err", http.StatusInternalServerError)
 	}
 
-	otherUrl := p.Category.GetOtherUrl(request.Stream)
+	// 根据 Action 确定正确的 URL
+	otherUrl := getVertexAIGeminiURL(request.Action, request.Stream)
 	modelName := p.Category.GetModelName(request.Model)
 
 	// 获取请求地址
@@ -80,36 +86,76 @@ func (p *VertexAIProvider) getGeminiRequest(request *gemini.GeminiChatRequest) (
 		return nil, common.StringErrorWrapperLocal("vertexAI config error", "invalid_vertexai_config", http.StatusInternalServerError)
 	}
 
-	headers := p.GetRequestHeaders()
-
-	if headers == nil {
-		return nil, common.StringErrorWrapperLocal("vertexAI config error", "invalid_vertexai_config", http.StatusInternalServerError)
+	headers, err := p.getRequestHeadersInternal()
+	if err != nil {
+		return nil, p.handleTokenError(err)
 	}
 
 	if request.Stream {
 		headers["Accept"] = "text/event-stream"
 	}
 
-	rawData, exists := p.GetRawBody()
-	if !exists {
-		return nil, common.StringErrorWrapperLocal("request body not found", "request_body_not_found", http.StatusInternalServerError)
-	}
-
 	// 错误处理
 	p.Requester.ErrorHandler = RequestErrorHandle(p.Category.ErrorHandler)
 
-	// 清理原始 JSON 数据中不兼容的字段
-	cleanedData, err := gemini.CleanGeminiRequestData(rawData, true)
-	if err != nil {
-		return nil, common.ErrorWrapper(err, "clean_vertexai_gemini_data_failed", http.StatusInternalServerError)
+	// 字节级路径：优先使用已清理的字节缓存，避免对含 base64 的大请求做 json.Unmarshal/Marshal
+	bodyBytes, wasVertexAI, exists := p.GetProcessedBodyBytes()
+	if exists && wasVertexAI {
+		// 缓存命中（VertexAI → VertexAI 重试）
+		req, errWithCode := p.NewRequestWithCustomParamsBytes(http.MethodPost, fullRequestURL, bodyBytes, headers, request.Model)
+		if errWithCode != nil {
+			return nil, errWithCode
+		}
+		return req, nil
 	}
 
-	// 使用BaseProvider的统一方法创建请求，支持额外参数处理
-	req, errWithCode := p.NewRequestWithCustomParams(http.MethodPost, fullRequestURL, cleanedData, headers, request.Model)
-	if errWithCode != nil {
-		return nil, errWithCode
+	// 从原始字节清理
+	if rawData, rawExists := p.GetRawBody(); rawExists {
+		cleaned, err := gemini.CleanGeminiRequestBytes(rawData, true)
+		if err != nil {
+			return nil, common.ErrorWrapper(err, "clean_gemini_request_bytes_failed", http.StatusInternalServerError)
+		}
+		p.SetProcessedBodyBytes(cleaned, true)
+		req, errWithCode := p.NewRequestWithCustomParamsBytes(http.MethodPost, fullRequestURL, cleaned, headers, request.Model)
+		if errWithCode != nil {
+			return nil, errWithCode
+		}
+		return req, nil
 	}
-	return req, nil
+
+	// map 回退（跨 provider 重试）
+	dataMap, _, mapExists := p.GetProcessedBody()
+	if mapExists {
+		gemini.CleanGeminiRequestMap(dataMap, true)
+		req, errWithCode := p.NewRequestWithCustomParams(http.MethodPost, fullRequestURL, dataMap, headers, request.Model)
+		if errWithCode != nil {
+			return nil, errWithCode
+		}
+		return req, nil
+	}
+
+	return nil, common.StringErrorWrapperLocal("request body not found", "request_body_not_found", http.StatusInternalServerError)
+}
+
+// getVertexAIGeminiURL 根据 Action 和 Stream 返回正确的 Vertex AI URL
+func getVertexAIGeminiURL(action string, stream bool) string {
+	switch action {
+	case "countTokens":
+		return "countTokens"
+	case "streamGenerateContent":
+		return "streamGenerateContent?alt=sse"
+	case "generateContent":
+		if stream {
+			return "streamGenerateContent?alt=sse"
+		}
+		return "generateContent"
+	default:
+		// 对于其他 action，直接使用原始值
+		if stream && !strings.Contains(action, "stream") {
+			return "stream" + strings.Title(action) + "?alt=sse"
+		}
+		return action
+	}
 }
 
 func convertOpenAIUsage(geminiUsage *gemini.GeminiUsageMetadata) types.Usage {

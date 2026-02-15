@@ -10,12 +10,16 @@ const config = {
     UptimeDomain: '',
     UptimePageName: '',
     UserInvoiceMonth: false,
+    builtin_chat_enabled: true,
     chat_link: '',
     display_in_currency: true,
     email_verification: false,
     footer_html: '',
+    analytics_code: '',
     github_client_id: '',
     github_oauth: false,
+    linuxDo_client_id: '',
+    linuxDo_oauth: false,
     oidc_auth: false,
     logo: '',
     quota_per_unit: 500000,
@@ -32,6 +36,7 @@ const config = {
     lark_login: false,
     lark_client_id: '',
     telegram_bot: '',
+    max_log_query_days: 180,
     isLoading: true // 添加加载状态
   }
 };

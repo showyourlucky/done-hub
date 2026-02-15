@@ -3,13 +3,17 @@ package gemini
 import (
 	"done-hub/common"
 	"done-hub/common/config"
+	"done-hub/common/model_utils"
 	"done-hub/common/requester"
 	"done-hub/common/utils"
 	"done-hub/providers/base"
 	"done-hub/types"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/gin-gonic/gin"
 )
 
 const (
@@ -20,7 +24,8 @@ type GeminiStreamHandler struct {
 	Usage   *types.Usage
 	Request *types.ChatCompletionRequest
 
-	key string
+	Key     string
+	Context *gin.Context // 添加 Context 用于获取响应模型名称
 }
 
 type OpenAIStreamHandler struct {
@@ -82,17 +87,16 @@ func (p *GeminiProvider) CreateChatCompletionStream(request *types.ChatCompletio
 		Usage:   p.Usage,
 		Request: request,
 
-		key: channel.Key,
+		Key:     channel.Key,
+		Context: p.Context, // 传递 Context
 	}
 
 	return requester.RequestStream(p.Requester, resp, chatHandler.HandlerStream)
 }
 
 func (p *GeminiProvider) getChatRequest(geminiRequest *GeminiChatRequest, isRelay bool) (*http.Request, *types.OpenAIErrorWithStatusCode) {
-	url := "generateContent"
-	if geminiRequest.Stream {
-		url = "streamGenerateContent?alt=sse"
-	}
+	// 根据 Action 确定正确的 URL
+	url := p.getActionURL(geminiRequest)
 	// 获取请求地址
 	fullRequestURL := p.GetFullRequestURL(url, geminiRequest.Model)
 
@@ -102,43 +106,103 @@ func (p *GeminiProvider) getChatRequest(geminiRequest *GeminiChatRequest, isRela
 		headers["Accept"] = "text/event-stream"
 	}
 
-	var body any
 	if isRelay {
-		var exists bool
-		rawData, exists := p.GetRawBody()
-		if !exists {
-			return nil, common.StringErrorWrapperLocal("request body not found", "request_body_not_found", http.StatusInternalServerError)
+		// 字节级路径：优先使用已清理的字节缓存，避免对含 base64 的大请求做 json.Unmarshal/Marshal
+		bodyBytes, wasVertexAI, exists := p.GetProcessedBodyBytes()
+		if exists && !wasVertexAI {
+			// 缓存命中（Gemini → Gemini 重试）
+			req, errWithCode := p.NewRequestWithCustomParamsBytes(http.MethodPost, fullRequestURL, bodyBytes, headers, geminiRequest.Model)
+			if errWithCode != nil {
+				return nil, errWithCode
+			}
+			return req, nil
 		}
-		cleanedData, err := CleanGeminiRequestData(rawData, false)
-		if err != nil {
-			return nil, common.ErrorWrapper(err, "clean_relay_data_failed", http.StatusInternalServerError)
+
+		// 从原始字节清理
+		if rawData, rawExists := p.GetRawBody(); rawExists {
+			cleaned, err := CleanGeminiRequestBytes(rawData, false)
+			if err != nil {
+				return nil, common.ErrorWrapper(err, "clean_gemini_request_bytes_failed", http.StatusInternalServerError)
+			}
+			p.SetProcessedBodyBytes(cleaned, false)
+			req, errWithCode := p.NewRequestWithCustomParamsBytes(http.MethodPost, fullRequestURL, cleaned, headers, geminiRequest.Model)
+			if errWithCode != nil {
+				return nil, errWithCode
+			}
+			return req, nil
 		}
-		body = cleanedData
-	} else {
-		p.pluginHandle(geminiRequest)
-		body = geminiRequest
+
+		// map 回退（跨 provider 重试，如 GeminiCli → Gemini）
+		dataMap, _, mapExists := p.GetProcessedBody()
+		if mapExists {
+			CleanGeminiRequestMap(dataMap, false)
+			req, errWithCode := p.NewRequestWithCustomParams(http.MethodPost, fullRequestURL, dataMap, headers, geminiRequest.Model)
+			if errWithCode != nil {
+				return nil, errWithCode
+			}
+			return req, nil
+		}
+
+		return nil, common.StringErrorWrapperLocal("request body not found", "request_body_not_found", http.StatusInternalServerError)
 	}
 
-	// 创建请求
-	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(body), p.Requester.WithHeader(headers))
-	if err != nil {
-		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+	// 非 relay 路径（OpenAI → Gemini 转换）
+	p.pluginHandle(geminiRequest)
+	req, errWithCode := p.NewRequestWithCustomParams(http.MethodPost, fullRequestURL, geminiRequest, headers, geminiRequest.Model)
+	if errWithCode != nil {
+		return nil, errWithCode
 	}
 
 	return req, nil
 }
 
-// CleanGeminiRequestData 清理 Gemini 请求数据中的不兼容字段
-func CleanGeminiRequestData(rawData []byte, isVertexAI bool) ([]byte, error) {
-	var data map[string]interface{}
-	if err := json.Unmarshal(rawData, &data); err != nil {
-		return nil, err
+// getActionURL 根据 Action 返回正确的 URL
+func (p *GeminiProvider) getActionURL(geminiRequest *GeminiChatRequest) string {
+	action := geminiRequest.Action
+	if action == "" {
+		// 默认为 generateContent
+		action = "generateContent"
 	}
 
+	// 根据不同的 action 构建 URL
+	switch action {
+	case "countTokens":
+		return "countTokens"
+	case "streamGenerateContent":
+		return "streamGenerateContent?alt=sse"
+	case "generateContent":
+		if geminiRequest.Stream {
+			return "streamGenerateContent?alt=sse"
+		}
+		return "generateContent"
+	case "predictLongRunning":
+		// Veo 3.0 视频生成
+		return "predictLongRunning"
+	default:
+		// 对于其他 action，直接使用原始值
+		if geminiRequest.Stream && !strings.Contains(action, "stream") {
+			return "stream" + strings.Title(action) + "?alt=sse"
+		}
+		return action
+	}
+}
+
+// CleanGeminiRequestMap 直接在 map 上清理 Gemini 请求数据中的不兼容字段
+func CleanGeminiRequestMap(data map[string]interface{}, isVertexAI bool) {
 	// 清理 contents 中的 function_call 和 function_response 字段中的 id
 	if contents, ok := data["contents"].([]interface{}); ok {
+		// 验证和修复函数调用序列
+		contents = validateAndFixFunctionCallSequence(contents)
+		data["contents"] = contents
+
 		for _, content := range contents {
 			if contentMap, ok := content.(map[string]interface{}); ok {
+				// 确保每个 content 都有 role 字段（Vertex AI 和 Gemini 都需要）
+				if _, hasRole := contentMap["role"]; !hasRole {
+					// 如果没有 role 字段，默认设置为 "user"
+					contentMap["role"] = "user"
+				}
+
 				if parts, ok := contentMap["parts"].([]interface{}); ok {
 					for _, part := range parts {
 						if partMap, ok := part.(map[string]interface{}); ok {
@@ -164,74 +228,248 @@ func CleanGeminiRequestData(rawData []byte, isVertexAI bool) ([]byte, error) {
 		}
 	}
 
-	// 如果是 Vertex AI，还需要清理 tools 中的 tool_type 字段
-	if isVertexAI {
-		if tools, ok := data["tools"].([]interface{}); ok {
-			var validTools []interface{}
-			for _, tool := range tools {
-				if toolMap, ok := tool.(map[string]interface{}); ok {
-					// 移除所有可能的 tool_type 相关字段，因为 Gemini API 不需要
+	// 清理 tools 中 Gemini API 不支持的字段
+	if tools, ok := data["tools"].([]interface{}); ok {
+		var validTools []interface{}
+		for _, tool := range tools {
+			if toolMap, ok := tool.(map[string]interface{}); ok {
+				// Vertex AI 需要移除 tool_type 相关字段
+				if isVertexAI {
 					delete(toolMap, "tool_type")
 					delete(toolMap, "toolType")
 					delete(toolMap, "type")
+				}
 
-					// 清理 functionDeclarations 中的 $schema 字段
-					if functionDeclarations, ok := toolMap["functionDeclarations"].([]interface{}); ok {
-						for _, funcDecl := range functionDeclarations {
-							if funcDeclMap, ok := funcDecl.(map[string]interface{}); ok {
-								if parameters, ok := funcDeclMap["parameters"].(map[string]interface{}); ok {
-									// 移除 Vertex AI 不支持的 $schema 字段
-									delete(parameters, "$schema")
-									// 递归清理嵌套的 schema 对象
-									cleanSchemaRecursively(parameters)
-								}
+				// 清理 functionDeclarations 中 Gemini API 不支持的字段
+				if functionDeclarations, ok := toolMap["functionDeclarations"].([]interface{}); ok {
+					for _, funcDecl := range functionDeclarations {
+						if funcDeclMap, ok := funcDecl.(map[string]interface{}); ok {
+							// 移除 Gemini API 不支持的 strict 字段（OpenAI 特有）
+							delete(funcDeclMap, "strict")
+							if parameters, ok := funcDeclMap["parameters"].(map[string]interface{}); ok {
+								// 移除 Gemini API 不支持的 $schema 字段
+								delete(parameters, "$schema")
+								// 递归清理嵌套的 schema 对象
+								cleanSchemaRecursively(parameters)
 							}
-						}
-
-						if len(functionDeclarations) == 0 {
-							// 跳过空的工具
-							continue
 						}
 					}
 
-					// 检查工具是否有任何有效内容
-					hasValidContent := false
-					for key, value := range toolMap {
-						if key == "functionDeclarations" {
-							if arr, ok := value.([]interface{}); ok && len(arr) > 0 {
-								hasValidContent = true
-								break
-							}
-						} else if value != nil {
+					if len(functionDeclarations) == 0 {
+						// 跳过空的工具
+						continue
+					}
+				}
+
+				// 检查工具是否有任何有效内容
+				hasValidContent := false
+				for key, value := range toolMap {
+					if key == "functionDeclarations" {
+						if arr, ok := value.([]interface{}); ok && len(arr) > 0 {
 							hasValidContent = true
 							break
 						}
-					}
-
-					if hasValidContent {
-						validTools = append(validTools, toolMap)
+					} else if value != nil {
+						hasValidContent = true
+						break
 					}
 				}
-			}
 
-			// 如果没有有效工具，移除整个 tools 字段
-			if len(validTools) == 0 {
-				delete(data, "tools")
-			} else {
-				data["tools"] = validTools
+				if hasValidContent {
+					validTools = append(validTools, toolMap)
+				}
+			}
+		}
+
+		// 如果没有有效工具，移除整个 tools 字段
+		if len(validTools) == 0 {
+			delete(data, "tools")
+		} else {
+			data["tools"] = validTools
+		}
+	}
+}
+
+// getFunctionCallName 从 part 中提取 functionCall 的 name（兼容 camelCase 和 snake_case）
+func getFunctionCallName(partMap map[string]interface{}) (string, bool) {
+	for _, field := range []string{"functionCall", "function_call"} {
+		if fc, ok := partMap[field].(map[string]interface{}); ok {
+			name, _ := fc["name"].(string)
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// getFunctionResponseName 从 part 中提取 functionResponse 的 name（兼容 camelCase 和 snake_case）
+func getFunctionResponseName(partMap map[string]interface{}) (string, bool) {
+	for _, field := range []string{"functionResponse", "function_response"} {
+		if fr, ok := partMap[field].(map[string]interface{}); ok {
+			name, _ := fr["name"].(string)
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// extractFunctionCallNames 从 model turn 的 parts 中提取所有 functionCall 的 name
+func extractFunctionCallNames(contentMap map[string]interface{}) []string {
+	var names []string
+	parts, _ := contentMap["parts"].([]interface{})
+	for _, part := range parts {
+		if partMap, ok := part.(map[string]interface{}); ok {
+			if name, ok := getFunctionCallName(partMap); ok {
+				names = append(names, name)
 			}
 		}
 	}
-
-	return json.Marshal(data)
+	return names
 }
 
-// cleanSchemaRecursively 递归清理 schema 对象中的 $schema 字段
+// extractFunctionResponseNames 从 function/user turn 的 parts 中提取所有 functionResponse 的 name
+func extractFunctionResponseNames(contentMap map[string]interface{}) []string {
+	var names []string
+	parts, _ := contentMap["parts"].([]interface{})
+	for _, part := range parts {
+		if partMap, ok := part.(map[string]interface{}); ok {
+			if name, ok := getFunctionResponseName(partMap); ok {
+				names = append(names, name)
+			}
+		}
+	}
+	return names
+}
+
+// detectResponseFieldStyle 检测已有 parts 中 functionResponse 使用的字段风格
+func detectResponseFieldStyle(parts []interface{}) string {
+	for _, part := range parts {
+		if partMap, ok := part.(map[string]interface{}); ok {
+			if _, exists := partMap["functionResponse"]; exists {
+				return "functionResponse"
+			}
+			if _, exists := partMap["function_response"]; exists {
+				return "function_response"
+			}
+		}
+	}
+	return "functionResponse"
+}
+
+// validateAndFixFunctionCallSequence 验证和修复函数调用序列
+// 逐 turn 配对：当 model turn 包含 functionCall 时，检查紧随其后的 turn，
+// 确保 functionResponse 数量与 functionCall 1:1 匹配
+func validateAndFixFunctionCallSequence(contents []interface{}) []interface{} {
+	n := len(contents)
+	for i := 0; i < n-1; i++ {
+		modelMap, ok := contents[i].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		role, _ := modelMap["role"].(string)
+		if role != "model" {
+			continue
+		}
+
+		callNames := extractFunctionCallNames(modelMap)
+		if len(callNames) == 0 {
+			continue
+		}
+
+		nextMap, ok := contents[i+1].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// 校验下一个 turn 的 role，避免在非 response turn 上误操作
+		nextRole, _ := nextMap["role"].(string)
+		if nextRole == "model" {
+			continue
+		}
+
+		// 构建 call 名称频次
+		callFreq := make(map[string]int)
+		for _, name := range callNames {
+			callFreq[name]++
+		}
+
+		// 构建 response 名称频次
+		respNames := extractFunctionResponseNames(nextMap)
+		respFreq := make(map[string]int)
+		for _, name := range respNames {
+			respFreq[name]++
+		}
+
+		// 按名称比对是否完全匹配
+		matched := true
+		for name, cnt := range callFreq {
+			if respFreq[name] != cnt {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			for name, cnt := range respFreq {
+				if callFreq[name] != cnt {
+					matched = false
+					break
+				}
+			}
+		}
+		if matched {
+			continue
+		}
+
+		parts, _ := nextMap["parts"].([]interface{})
+
+		// 裁剪：移除没有对应 call 的多余 response
+		trimCallFreq := make(map[string]int)
+		for k, v := range callFreq {
+			trimCallFreq[k] = v
+		}
+		var fixedParts []interface{}
+		for _, part := range parts {
+			if partMap, ok := part.(map[string]interface{}); ok {
+				if name, ok := getFunctionResponseName(partMap); ok {
+					if trimCallFreq[name] > 0 {
+						trimCallFreq[name]--
+						fixedParts = append(fixedParts, part)
+					}
+					continue
+				}
+			}
+			fixedParts = append(fixedParts, part)
+		}
+
+		// 补齐：为缺少 response 的 call 补充空响应
+		fieldName := detectResponseFieldStyle(fixedParts)
+		for _, callName := range callNames {
+			if trimCallFreq[callName] > 0 {
+				trimCallFreq[callName]--
+				fixedParts = append(fixedParts, map[string]interface{}{
+					fieldName: map[string]interface{}{
+						"name": callName,
+						"response": map[string]interface{}{
+							"output": "",
+						},
+					},
+				})
+			}
+		}
+
+		nextMap["parts"] = fixedParts
+	}
+
+	return contents
+}
+
+// cleanSchemaRecursively 递归清理 schema 对象中的 $schema 和 additionalProperties 字段
 func cleanSchemaRecursively(obj interface{}) {
 	switch v := obj.(type) {
 	case map[string]interface{}:
-		// 删除 $schema 字段
+		// 删除 Gemini API 不支持的字段
 		delete(v, "$schema")
+		delete(v, "additionalProperties")
 
 		// 递归处理所有值
 		for _, value := range v {
@@ -285,7 +523,7 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*GeminiChatReq
 		},
 	}
 
-	if strings.HasPrefix(request.Model, "gemini-2.0-flash-exp") {
+	if model_utils.HasPrefixCaseInsensitive(request.Model, "gemini-2.0-flash-exp") || model_utils.HasPrefixCaseInsensitive(request.Model, "gemini-2.5-flash-image") || model_utils.HasPrefixCaseInsensitive(request.Model, "gemini-3-pro-image") {
 		geminiRequest.GenerationConfig.ResponseModalities = []string{"Text", "Image"}
 	}
 
@@ -293,13 +531,61 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*GeminiChatReq
 		geminiRequest.GenerationConfig.ResponseModalities = []string{"AUDIO"}
 	}
 
+	// 历史消息约束检查：防止下游 400 错误
+	// 如果启用 thinking 但历史 assistant 消息不以 thinking/redacted_thinking 开头，则不启用
+	canEnableThinking := shouldEnableThinking(request.Messages)
+
+	// 1. 基础检查：是否有 reasoning 参数
 	if request.Reasoning != nil {
-		geminiRequest.GenerationConfig.ThinkingConfig = &ThinkingConfig{
-			ThinkingBudget: &request.Reasoning.MaxTokens,
+
+		if canEnableThinking {
+			budget := request.Reasoning.MaxTokens
+			maxTokens := request.MaxTokens
+
+			// 3. Token 校验与调整：验证 thinkingBudget < maxOutputTokens
+			// Gemini API 要求 Budget 必须严格小于 MaxOutputTokens
+			if maxTokens > 0 && budget >= maxTokens {
+				// 自动下调 budget
+				budget = maxTokens - 1
+			}
+
+			// 初始化 ThinkingConfig
+			thinkingConfig := &ThinkingConfig{
+				IncludeThoughts: true, // 只要进入 Reasoning 模式，通常都希望包含思考过程
+			}
+			hasConfig := false
+
+			// 4. 设置 Budget (仅当 budget 有效时)
+			if budget > 0 {
+				thinkingConfig.ThinkingBudget = &budget
+				hasConfig = true
+			}
+
+			// 5. 设置 ThinkingLevel (映射 effort 参数)
+			if request.Reasoning.Effort != "" {
+				effortToLevelMap := map[string]string{
+					"minimal": "MINIMAL",
+					"low":     "LOW",
+					"medium":  "MEDIUM",
+					"high":    "HIGH",
+				}
+				if level, ok := effortToLevelMap[request.Reasoning.Effort]; ok {
+					thinkingConfig.ThinkingLevel = level
+					hasConfig = true
+				}
+			}
+
+			// 6. 最终应用配置
+			// 注意：如果有 reasoning 参数但 budget 归零且无 effort，可能不应该下发空 config
+			// 但如果有 IncludeThoughts=true，通常也是有效的。
+			// 这里判断 hasConfig 主要是为了确保至少设置了 Budget 或 Level，或者保留 IncludeThoughts
+			if hasConfig {
+				geminiRequest.GenerationConfig.ThinkingConfig = thinkingConfig
+			}
 		}
 	}
 
-	if config.GeminiSettingsInstance.GetOpenThink(request.Model) {
+	if config.GeminiSettingsInstance.GetOpenThink(request.Model) && canEnableThinking {
 		if geminiRequest.GenerationConfig.ThinkingConfig == nil {
 			geminiRequest.GenerationConfig.ThinkingConfig = &ThinkingConfig{}
 		}
@@ -330,9 +616,12 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*GeminiChatReq
 			if params, ok := function.Parameters.(map[string]interface{}); ok {
 				if properties, ok := params["properties"].(map[string]interface{}); ok && len(properties) == 0 {
 					function.Parameters = nil
+				} else {
+					cleanSchemaRecursively(params)
 				}
 			}
 
+			function.Strict = nil
 			geminiChatTools.FunctionDeclarations = append(geminiChatTools.FunctionDeclarations, *function)
 		}
 
@@ -365,6 +654,7 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*GeminiChatReq
 
 	if systemContent != "" {
 		geminiRequest.SystemInstruction = &GeminiChatContent{
+			Role: "user",
 			Parts: []GeminiPart{
 				{Text: systemContent},
 			},
@@ -403,6 +693,20 @@ func removeAdditionalPropertiesWithDepth(schema interface{}, depth int) interfac
 	}
 
 	delete(v, "title")
+	// 删除 $schema 字段，因为 Gemini API 不支持
+	delete(v, "$schema")
+
+	// 处理format字段的限制 - Gemini API只支持STRING类型的"enum"和"date-time"格式
+	if formatVal, exists := v["format"]; exists {
+		if formatStr, ok := formatVal.(string); ok {
+			if typeVal, typeExists := v["type"]; typeExists && typeVal == "string" {
+				// 只保留Gemini支持的format
+				if formatStr != "enum" && formatStr != "date-time" {
+					delete(v, "format")
+				}
+			}
+		}
+	}
 
 	switch v["type"] {
 	case "object":
@@ -430,25 +734,50 @@ func removeAdditionalPropertiesWithDepth(schema interface{}, depth int) interfac
 }
 
 func ConvertToChatOpenai(provider base.ProviderInterface, response *GeminiChatResponse, request *types.ChatCompletionRequest) (openaiResponse *types.ChatCompletionResponse, errWithCode *types.OpenAIErrorWithStatusCode) {
+	// 获取响应中应该使用的模型名称
+	responseModel := provider.GetResponseModelName(request.Model)
+
 	openaiResponse = &types.ChatCompletionResponse{
 		ID:      response.ResponseId,
 		Object:  "chat.completion",
 		Created: utils.GetTimestamp(),
-		Model:   request.Model,
+		Model:   responseModel,
 		Choices: make([]types.ChatCompletionChoice, 0, len(response.Candidates)),
 	}
 
-	if len(response.Candidates) == 0 {
+	// 检查是否是 countTokens 请求
+	// Gemini 直连：有 UsageMetadata 且 Candidates 为空
+	// Vertex AI：有 TotalTokens 且 Candidates 为空
+	isCountTokens := len(response.Candidates) == 0 &&
+		(response.UsageMetadata != nil || response.TotalTokens > 0)
+
+	if !isCountTokens && len(response.Candidates) == 0 {
 		errWithCode = common.StringErrorWrapper("no candidates", "no_candidates", http.StatusInternalServerError)
 		return
 	}
 
-	for _, candidate := range response.Candidates {
-		openaiResponse.Choices = append(openaiResponse.Choices, candidate.ToOpenAIChoice(request))
+	// 如果是 countTokens 请求，创建一个特殊的响应
+	if isCountTokens {
+		// 为 countTokens 创建一个包含 token 信息的响应
+		openaiResponse.Choices = []types.ChatCompletionChoice{
+			{
+				Index: 0,
+				Message: types.ChatCompletionMessage{
+					Role:    types.ChatMessageRoleAssistant,
+					Content: fmt.Sprintf("Token count: %d", response.UsageMetadata.TotalTokenCount),
+				},
+				FinishReason: types.FinishReasonStop,
+			},
+		}
+	} else {
+		// 正常的 generateContent 响应处理
+		for _, candidate := range response.Candidates {
+			openaiResponse.Choices = append(openaiResponse.Choices, candidate.ToOpenAIChoice(request))
+		}
 	}
 
 	usage := provider.GetUsage()
-	*usage = ConvertOpenAIUsage(response.UsageMetadata)
+	*usage = ConvertOpenAIUsageWithFallback(response.UsageMetadata, response)
 	openaiResponse.Usage = usage
 
 	return
@@ -472,7 +801,7 @@ func (h *GeminiStreamHandler) HandlerStream(rawLine *[]byte, dataChan chan strin
 		return
 	}
 
-	aiError := errorHandle(&geminiResponse.GeminiErrorResponse, h.key)
+	aiError := errorHandle(&geminiResponse.GeminiErrorResponse, h.Key)
 	if aiError != nil {
 		errChan <- aiError
 		return
@@ -483,11 +812,17 @@ func (h *GeminiStreamHandler) HandlerStream(rawLine *[]byte, dataChan chan strin
 }
 
 func (h *GeminiStreamHandler) convertToOpenaiStream(geminiResponse *GeminiChatResponse, dataChan chan string) {
+	// 获取响应中应该使用的模型名称
+	responseModel := h.Request.Model
+	if h.Context != nil {
+		responseModel = base.GetResponseModelNameFromContext(h.Context, h.Request.Model)
+	}
+
 	streamResponse := types.ChatCompletionStreamResponse{
 		ID:      geminiResponse.ResponseId,
 		Object:  "chat.completion.chunk",
 		Created: utils.GetTimestamp(),
-		Model:   h.Request.Model,
+		Model:   responseModel,
 		// Choices: choices,
 	}
 
@@ -530,7 +865,22 @@ func (h *GeminiStreamHandler) convertToOpenaiStream(geminiResponse *GeminiChatRe
 	}
 
 	// 和ExecutableCode的tokens共用，所以跳过
-	if geminiResponse.UsageMetadata == nil {
+	// 检查是否有有效的 UsageMetadata
+	hasValidUsage := false
+	if geminiResponse.UsageMetadata != nil &&
+		(geminiResponse.UsageMetadata.TotalTokenCount > 0 || geminiResponse.UsageMetadata.PromptTokenCount > 0) {
+		hasValidUsage = true
+	}
+
+	if !hasValidUsage {
+		// 没有有效的 UsageMetadata，尝试从响应内容中统计图片数量
+		imageCount := countImagesInResponse(geminiResponse)
+		if imageCount > 0 {
+			// 按图片数量计费：每张图片 1290 tokens
+			const tokensPerImage = 1290
+			h.Usage.CompletionTokens = imageCount * tokensPerImage
+			h.Usage.TotalTokens = h.Usage.PromptTokens + h.Usage.CompletionTokens
+		}
 		return
 	}
 
@@ -596,29 +946,72 @@ var modelAdjustRatios = map[string]int{
 
 func ConvertOpenAIUsage(geminiUsage *GeminiUsageMetadata) types.Usage {
 	if geminiUsage == nil {
-		return types.Usage{}
+		return types.Usage{
+			PromptTokens:     0,
+			CompletionTokens: 0,
+			TotalTokens:      0,
+		}
 	}
 
-	// 计算 completion tokens，确保不为负数
-	completionTokens := geminiUsage.CandidatesTokenCount + geminiUsage.ThoughtsTokenCount
-	if completionTokens < 0 {
-		completionTokens = 0
-	}
-
-	// 如果 TotalTokenCount 为 0 但有 PromptTokenCount，则计算总数
-	totalTokens := geminiUsage.TotalTokenCount
-	if totalTokens == 0 && geminiUsage.PromptTokenCount > 0 {
-		totalTokens = geminiUsage.PromptTokenCount + completionTokens
-	}
-
-	return types.Usage{
+	usage := types.Usage{
 		PromptTokens:     geminiUsage.PromptTokenCount,
-		CompletionTokens: completionTokens,
-		TotalTokens:      totalTokens,
+		CompletionTokens: geminiUsage.CandidatesTokenCount + geminiUsage.ThoughtsTokenCount,
+		TotalTokens:      geminiUsage.TotalTokenCount,
 
 		CompletionTokensDetails: types.CompletionTokensDetails{
 			ReasoningTokens: geminiUsage.ThoughtsTokenCount,
 		},
+	}
+
+	for _, p := range geminiUsage.PromptTokensDetails {
+		switch p.Modality {
+		case "TEXT":
+			usage.PromptTokensDetails.TextTokens = p.TokenCount
+		case "AUDIO":
+			usage.PromptTokensDetails.AudioTokens = p.TokenCount
+		}
+	}
+
+	for _, c := range geminiUsage.CandidatesTokensDetails {
+		switch c.Modality {
+		case "TEXT":
+			usage.CompletionTokensDetails.TextTokens = c.TokenCount
+		case "AUDIO":
+			usage.CompletionTokensDetails.AudioTokens = c.TokenCount
+		case "IMAGE":
+			usage.CompletionTokensDetails.ImageTokens = c.TokenCount
+		}
+	}
+
+	return usage
+}
+
+// ConvertOpenAIUsageWithFallback 转换 UsageMetadata，如果没有有效的 token 统计则使用图片统计兜底
+func ConvertOpenAIUsageWithFallback(geminiUsage *GeminiUsageMetadata, response *GeminiChatResponse) types.Usage {
+	// 检查是否有有效的 UsageMetadata
+	hasValidUsage := geminiUsage != nil &&
+		(geminiUsage.TotalTokenCount > 0 || geminiUsage.PromptTokenCount > 0)
+
+	if hasValidUsage {
+		return ConvertOpenAIUsage(geminiUsage)
+	}
+
+	// 没有有效的 UsageMetadata，尝试从响应内容中统计图片数量
+	imageCount := countImagesInResponse(response)
+	if imageCount > 0 {
+		const tokensPerImage = 1290
+		return types.Usage{
+			PromptTokens:     0,
+			CompletionTokens: imageCount * tokensPerImage,
+			TotalTokens:      imageCount * tokensPerImage,
+		}
+	}
+
+	// 完全没有数据，返回空 Usage
+	return types.Usage{
+		PromptTokens:     0,
+		CompletionTokens: 0,
+		TotalTokens:      0,
 	}
 }
 
@@ -639,4 +1032,54 @@ func (p *GeminiProvider) pluginHandle(request *GeminiChatRequest) {
 		CodeExecution: &GeminiCodeExecution{},
 	})
 
+}
+
+// checkLastAssistantFirstBlockType 检查最后一条 assistant 消息的第一个 block 类型
+// 返回值：第一个 block 的类型，如果没有 assistant 消息或没有数组格式的 content 则返回空字符串
+// 注意：只检查数组格式的 content
+func checkLastAssistantFirstBlockType(messages []types.ChatCompletionMessage) string {
+	// 从后往前遍历，找到最后一条 assistant 消息
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role != types.ChatMessageRoleAssistant {
+			continue
+		}
+
+		// 检查 content 是否为数组格式
+		// 如果 content 是字符串，跳过这条消息
+		if _, ok := msg.Content.(string); ok {
+			continue
+		}
+
+		// 解析 content（此时 content 应该是数组格式）
+		parts := msg.ParseContent()
+		if len(parts) == 0 {
+			continue
+		}
+
+		// 返回第一个 block 的类型
+		return parts[0].Type
+	}
+
+	return ""
+}
+
+// shouldEnableThinking 检查是否应该启用 thinking
+// 如果启用 thinking 但历史 assistant 消息不以 thinking/redacted_thinking 开头，
+// 则不应该下发 thinkingConfig（避免下游 400 错误）
+func shouldEnableThinking(messages []types.ChatCompletionMessage) bool {
+	firstBlockType := checkLastAssistantFirstBlockType(messages)
+
+	// 如果没有历史 assistant 消息（firstBlockType 为空），可以启用 thinking
+	if firstBlockType == "" {
+		return true
+	}
+
+	// 如果第一个 block 是 thinking 或 redacted_thinking，可以启用 thinking
+	if firstBlockType == "thinking" || firstBlockType == "redacted_thinking" {
+		return true
+	}
+
+	// 其他情况，不应该启用 thinking
+	return false
 }

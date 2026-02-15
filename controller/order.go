@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
 	"done-hub/common"
 	"done-hub/common/config"
@@ -100,30 +101,66 @@ func CreateOrder(c *gin.Context) {
 	})
 }
 
-// tradeNo lock
+// orderLockEntry 订单锁条目，带时间戳用于清理
+type orderLockEntry struct {
+	lock     *sync.Mutex
+	lastUsed time.Time
+}
+
 var orderLocks sync.Map
 var createLock sync.Mutex
 
+func init() {
+	go cleanupOrderLocks()
+}
+
+// cleanupOrderLocks 定期清理长时间未使用的订单锁
+func cleanupOrderLocks() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		now := time.Now()
+		orderLocks.Range(func(key, value interface{}) bool {
+			if entry := value.(*orderLockEntry); now.Sub(entry.lastUsed) > 30*time.Minute {
+				orderLocks.Delete(key)
+			}
+			return true
+		})
+	}
+}
+
 // LockOrder 尝试对给定订单号加锁
 func LockOrder(tradeNo string) {
-	lock, ok := orderLocks.Load(tradeNo)
+	var entry *orderLockEntry
+	val, ok := orderLocks.Load(tradeNo)
 	if !ok {
 		createLock.Lock()
-		defer createLock.Unlock()
-		lock, ok = orderLocks.Load(tradeNo)
+		val, ok = orderLocks.Load(tradeNo)
 		if !ok {
-			lock = new(sync.Mutex)
-			orderLocks.Store(tradeNo, lock)
+			entry = &orderLockEntry{
+				lock:     new(sync.Mutex),
+				lastUsed: time.Now(),
+			}
+			orderLocks.Store(tradeNo, entry)
+		} else {
+			entry = val.(*orderLockEntry)
 		}
+		createLock.Unlock()
+	} else {
+		entry = val.(*orderLockEntry)
 	}
-	lock.(*sync.Mutex).Lock()
+	entry.lastUsed = time.Now()
+	entry.lock.Lock()
 }
 
 // UnlockOrder 释放给定订单号的锁
 func UnlockOrder(tradeNo string) {
-	lock, ok := orderLocks.Load(tradeNo)
+	val, ok := orderLocks.Load(tradeNo)
 	if ok {
-		lock.(*sync.Mutex).Unlock()
+		entry := val.(*orderLockEntry)
+		entry.lastUsed = time.Now()
+		entry.lock.Unlock()
 	}
 }
 
@@ -218,13 +255,21 @@ func calculateOrderAmount(payment *model.Payment, amount int) (discountMoney, fe
 		fee = payment.FixedFee
 	}
 
-	//实际费用=（折后价+折后手续费）*汇率
+	//实际费用=（折后价+折后手续费）*汇率*网关倍率
 	total := utils.Decimal(newMoney+fee, 2)
+
+	// 获取网关倍率，默认为1
+	currencyRate := payment.CurrencyRate
+	if currencyRate <= 0 {
+		currencyRate = 1
+	}
+
 	if payment.Currency == model.CurrencyTypeUSD {
-		payMoney = total
+		oldTotal = utils.Decimal(oldTotal*currencyRate, 2)
+		payMoney = utils.Decimal(total*currencyRate, 2)
 	} else {
-		oldTotal = utils.Decimal(oldTotal*config.PaymentUSDRate, 2)
-		payMoney = utils.Decimal(total*config.PaymentUSDRate, 2)
+		oldTotal = utils.Decimal(oldTotal*config.PaymentUSDRate*currencyRate, 2)
+		payMoney = utils.Decimal(total*config.PaymentUSDRate*currencyRate, 2)
 	}
 	discountMoney = oldTotal - payMoney //折扣金额 = 原价值-实际支付价值
 	return
@@ -247,4 +292,72 @@ func GetOrderList(c *gin.Context) {
 		"message": "",
 		"data":    payments,
 	})
+}
+
+// EpayCallback 固定的易支付回调接口
+func EpayCallback(c *gin.Context) {
+	tradeNo := c.Query("out_trade_no")
+	if tradeNo == "" {
+		c.String(http.StatusOK, "fail")
+		return
+	}
+
+	order, err := model.GetOrderByTradeNo(tradeNo)
+	if err != nil {
+		logger.SysError(fmt.Sprintf("epay callback failed to find order, trade_no: %s", tradeNo))
+		c.String(http.StatusOK, "fail")
+		return
+	}
+
+	gatewayPayment, err := model.GetPaymentByID(order.GatewayId)
+	if err != nil {
+		logger.SysError(fmt.Sprintf("epay callback failed to find payment, trade_no: %s, gateway_id: %d", tradeNo, order.GatewayId))
+		c.String(http.StatusOK, "fail")
+		return
+	}
+
+	paymentService, err := payment.NewPaymentService(gatewayPayment.UUID)
+	if err != nil {
+		logger.SysError(fmt.Sprintf("epay callback failed to create payment service, trade_no: %s", tradeNo))
+		c.String(http.StatusOK, "fail")
+		return
+	}
+
+	payNotify, err := paymentService.HandleCallback(c, paymentService.Payment.Config)
+	if err != nil {
+		return
+	}
+
+	LockOrder(payNotify.GatewayNo)
+	defer UnlockOrder(payNotify.GatewayNo)
+
+	if order.Status != model.OrderStatusPending {
+		return
+	}
+
+	order.GatewayNo = payNotify.GatewayNo
+	order.Status = model.OrderStatusSuccess
+	err = order.Update()
+	if err != nil {
+		logger.SysError(fmt.Sprintf("epay callback failed to update order, trade_no: %s", tradeNo))
+		return
+	}
+
+	err = model.IncreaseUserQuota(order.UserId, order.Quota)
+	if err != nil {
+		logger.SysError(fmt.Sprintf("epay callback failed to increase user quota, trade_no: %s", tradeNo))
+		return
+	}
+
+	err = model.CheckAndUpgradeUserGroup(order.UserId, order.Quota)
+	if err != nil {
+		logger.SysError(fmt.Sprintf("epay callback failed to upgrade user group, trade_no: %s, error: %s", tradeNo, err.Error()))
+	}
+
+	model.RecordQuotaLog(order.UserId, model.LogTypeTopup, order.Quota, c.ClientIP(), fmt.Sprintf("在线充值成功，充值积分: %d，支付金额：%.2f %s", order.Quota, order.OrderAmount, order.OrderCurrency))
+
+	err = model.ProcessInviterReward(order.UserId, order.Quota, c.ClientIP())
+	if err != nil {
+		logger.SysError(fmt.Sprintf("epay callback failed to process inviter reward, trade_no: %s, error: %s", tradeNo, err.Error()))
+	}
 }

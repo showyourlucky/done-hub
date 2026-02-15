@@ -26,6 +26,9 @@ func GetUserModelStatisticsByPeriod(userId int, startTime, endTime string) (LogS
 		dateStr = "TO_CHAR(date, 'YYYY-MM-DD') as date"
 	} else if common.UsingSQLite {
 		dateStr = "strftime('%Y-%m-%d', date) as date"
+	} else {
+		// MySQL/TiDB - 显式格式化日期以确保兼容性
+		dateStr = "DATE_FORMAT(date, '%Y-%m-%d') as date"
 	}
 
 	err = DB.Raw(`
@@ -45,6 +48,91 @@ func GetUserModelStatisticsByPeriod(userId int, startTime, endTime string) (LogS
 	return
 }
 
+// UserGroupedStatistic 按用户分组的统计数据(不按模型分组)
+type UserGroupedStatistic struct {
+	Username         string `gorm:"column:username" json:"username"`
+	RequestCount     int64  `gorm:"column:request_count" json:"request_count"`
+	Quota            int64  `gorm:"column:quota" json:"quota"`
+	PromptTokens     int64  `gorm:"column:prompt_tokens" json:"prompt_tokens"`
+	CompletionTokens int64  `gorm:"column:completion_tokens" json:"completion_tokens"`
+	RequestTime      int64  `gorm:"column:request_time" json:"request_time"`
+}
+
+// ModelUsageByUser 按用户和模型分组的使用统计
+type ModelUsageByUser struct {
+	Username     string `gorm:"column:username" json:"username"`
+	ModelName    string `gorm:"column:model_name" json:"model_name"`
+	RequestCount int64  `gorm:"column:request_count" json:"request_count"`
+}
+
+// GetUserGroupedStatisticsByPeriod 获取按用户分组的统计数据(不按模型分组)
+func GetUserGroupedStatisticsByPeriod(usernames []string, startTime, endTime string) ([]*UserGroupedStatistic, error) {
+	if len(usernames) == 0 {
+		return nil, fmt.Errorf("usernames cannot be empty")
+	}
+
+	var statistics []*UserGroupedStatistic
+
+	// Build SQL query - group by username only
+	query := `
+		SELECT 
+			users.username,
+			SUM(statistics.request_count) as request_count,
+			SUM(statistics.quota) as quota,
+			SUM(statistics.prompt_tokens) as prompt_tokens,
+			SUM(statistics.completion_tokens) as completion_tokens,
+			SUM(statistics.request_time) as request_time
+		FROM statistics
+		INNER JOIN users ON statistics.user_id = users.id
+		WHERE users.username IN (?)
+		AND statistics.date BETWEEN ? AND ?
+		GROUP BY users.username
+		ORDER BY users.username
+	`
+
+	err := DB.Raw(query, usernames, startTime, endTime).Scan(&statistics).Error
+	if err != nil {
+		return nil, err
+	}
+
+	if statistics == nil {
+		statistics = []*UserGroupedStatistic{}
+	}
+	return statistics, nil
+}
+
+// GetModelUsageByUser 获取每个用户使用不同模型的调用次数
+func GetModelUsageByUser(usernames []string, startTime, endTime string) ([]*ModelUsageByUser, error) {
+	if len(usernames) == 0 {
+		return nil, fmt.Errorf("usernames cannot be empty")
+	}
+
+	var usage []*ModelUsageByUser
+
+	query := `
+		SELECT 
+			users.username,
+			statistics.model_name,
+			SUM(statistics.request_count) as request_count
+		FROM statistics
+		INNER JOIN users ON statistics.user_id = users.id
+		WHERE users.username IN (?)
+		AND statistics.date BETWEEN ? AND ?
+		GROUP BY users.username, statistics.model_name
+		ORDER BY users.username, request_count DESC
+	`
+
+	err := DB.Raw(query, usernames, startTime, endTime).Scan(&usage).Error
+	if err != nil {
+		return nil, err
+	}
+
+	if usage == nil {
+		usage = []*ModelUsageByUser{}
+	}
+	return usage, nil
+}
+
 func GetChannelExpensesStatisticsByPeriod(startTime, endTime, groupType string, userID int) (LogStatistics []*LogStatisticGroupChannel, err error) {
 
 	var whereClause strings.Builder
@@ -61,6 +149,9 @@ func GetChannelExpensesStatisticsByPeriod(startTime, endTime, groupType string, 
 		dateStr = "TO_CHAR(date, 'YYYY-MM-DD') as date"
 	} else if common.UsingSQLite {
 		dateStr = "strftime('%%Y-%%m-%%d', date) as date"
+	} else {
+		// MySQL/TiDB - 显式格式化日期以确保兼容性
+		dateStr = "DATE_FORMAT(date, '%%Y-%%m-%%d') as date"
 	}
 
 	baseSelect := `
@@ -138,58 +229,45 @@ func UpdateStatistics(updateType StatisticsUpdateType) error {
 	%s
 	`
 
-	// 获取系统时区偏移
-	getTimezoneOffset := func() (string, string) {
-		// 优先使用系统本地时区（Docker中通过TZ环境变量设置）
-		location := time.Local
-
-		// 也可以通过环境变量TZ覆盖
-		if tzEnv := os.Getenv("TZ"); tzEnv != "" {
-			if loc, err := time.LoadLocation(tzEnv); err == nil {
-				location = loc
-			}
-		}
-
-		// 获取当前时间在指定时区的偏移量
-		now := time.Now().In(location)
-		_, offset := now.Zone()
-
-		// 计算小时偏移
-		hours := offset / 3600
-		minutes := (offset % 3600) / 60
-
-		// 生成不同数据库需要的格式
-		var sqliteOffset, mysqlOffset string
-		if hours >= 0 {
-			sqliteOffset = fmt.Sprintf("+%d hours", hours)
-			if minutes != 0 {
-				sqliteOffset += fmt.Sprintf(" %d minutes", minutes)
-			}
-			mysqlOffset = fmt.Sprintf("+%02d:%02d", hours, minutes)
-		} else {
-			sqliteOffset = fmt.Sprintf("%d hours", hours) // 负数自带减号
-			if minutes != 0 {
-				sqliteOffset += fmt.Sprintf(" %d minutes", -minutes) // 分钟也要是负数
-			}
-			mysqlOffset = fmt.Sprintf("-%02d:%02d", -hours, -minutes)
-		}
-
-		return sqliteOffset, mysqlOffset
-	}
-
 	sqlPrefix := ""
 	sqlWhere := ""
 	sqlDate := ""
 	sqlSuffix := ""
+
+	// 统一获取时区信息
+	location := time.Local
+	if tzEnv := os.Getenv("TZ"); tzEnv != "" {
+		if loc, err := time.LoadLocation(tzEnv); err == nil {
+			location = loc
+		}
+	}
+	now := time.Now().In(location)
+	_, offsetSeconds := now.Zone()
+
+	// SQLite 需要特殊格式的偏移字符串
+	getSqliteOffset := func() string {
+		hours := offsetSeconds / 3600
+		minutes := (offsetSeconds % 3600) / 60
+		if hours >= 0 {
+			offset := fmt.Sprintf("+%d hours", hours)
+			if minutes != 0 {
+				offset += fmt.Sprintf(" %d minutes", minutes)
+			}
+			return offset
+		}
+		offset := fmt.Sprintf("%d hours", hours)
+		if minutes != 0 {
+			offset += fmt.Sprintf(" %d minutes", -minutes)
+		}
+		return offset
+	}
+
 	if common.UsingSQLite {
 		sqlPrefix = "INSERT OR REPLACE INTO"
-		// 动态获取时区偏移，而不是硬编码+8 hours
-		sqliteOffset, _ := getTimezoneOffset()
-		sqlDate = fmt.Sprintf("strftime('%%Y-%%m-%%d', datetime(created_at, 'unixepoch', '%s'))", sqliteOffset)
+		sqlDate = fmt.Sprintf("strftime('%%Y-%%m-%%d', datetime(created_at, 'unixepoch', '%s'))", getSqliteOffset())
 		sqlSuffix = ""
 	} else if common.UsingPostgreSQL {
 		sqlPrefix = "INSERT INTO"
-		// PostgreSQL使用系统时区
 		tzName := "UTC"
 		if tzEnv := os.Getenv("TZ"); tzEnv != "" {
 			tzName = tzEnv
@@ -203,9 +281,22 @@ func UpdateStatistics(updateType StatisticsUpdateType) error {
 		request_time = EXCLUDED.request_time`
 	} else {
 		sqlPrefix = "INSERT INTO"
-		// MySQL动态获取时区偏移
-		_, mysqlOffset := getTimezoneOffset()
-		sqlDate = fmt.Sprintf("DATE_FORMAT(CONVERT_TZ(FROM_UNIXTIME(created_at), '+00:00', '%s'), '%%Y-%%m-%%d')", mysqlOffset)
+		// MySQL: 检测 MySQL 时区，决定是否需要转换
+		if isMySQLUsingUTC() {
+			// MySQL 是 UTC，需要转换为本地时区
+			hours := offsetSeconds / 3600
+			minutes := (offsetSeconds % 3600) / 60
+			var tzOffset string
+			if hours >= 0 {
+				tzOffset = fmt.Sprintf("+%02d:%02d", hours, minutes)
+			} else {
+				tzOffset = fmt.Sprintf("-%02d:%02d", -hours, -minutes)
+			}
+			sqlDate = fmt.Sprintf("DATE(CONVERT_TZ(FROM_UNIXTIME(created_at), '+00:00', '%s'))", tzOffset)
+		} else {
+			// MySQL 是本地时区（SYSTEM 或 +08:00 等），直接使用
+			sqlDate = "DATE(FROM_UNIXTIME(created_at))"
+		}
 		sqlSuffix = `ON DUPLICATE KEY UPDATE
 		request_count = VALUES(request_count),
 		quota = VALUES(quota),
@@ -214,15 +305,6 @@ func UpdateStatistics(updateType StatisticsUpdateType) error {
 		request_time = VALUES(request_time)`
 	}
 
-	// 使用系统本地时区计算时间戳
-	location := time.Local
-	if tzEnv := os.Getenv("TZ"); tzEnv != "" {
-		if loc, err := time.LoadLocation(tzEnv); err == nil {
-			location = loc
-		}
-	}
-
-	now := time.Now().In(location)
 	todayTimestamp := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location).Unix()
 
 	switch updateType {

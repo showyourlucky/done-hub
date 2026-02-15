@@ -11,6 +11,7 @@ const AuthRegister = Loadable(lazy(() => import('views/Authentication/Auth/Regis
 const GitHubOAuth = Loadable(lazy(() => import('views/Authentication/Auth/GitHubOAuth')));
 const LarkOAuth = Loadable(lazy(() => import('views/Authentication/Auth/LarkOAuth')));
 const OIDCOAuth = Loadable(lazy(() => import('views/Authentication/Auth/OIDCOAuth')));
+const LinuxDoOAuth = Loadable(lazy(() => import('views/Authentication/Auth/LinuxDoOAuth')));
 const ForgetPassword = Loadable(lazy(() => import('views/Authentication/Auth/ForgetPassword')));
 const ResetPassword = Loadable(lazy(() => import('views/Authentication/Auth/ResetPassword')));
 const Home = Loadable(lazy(() => import('views/Home')));
@@ -23,7 +24,7 @@ const ModelPrice = Loadable(lazy(() => import('views/ModelPrice')));
 const WithMargins = ({ children }) => (
   <Box
     sx={{
-      maxWidth: '1200px',
+      maxWidth: '1700px',
       margin: '0 auto',
       padding: { xs: 0, sm: '0 24px' }
     }}
@@ -73,6 +74,10 @@ const OtherRoutes = {
     {
       path: '/oauth/lark',
       element: <LarkOAuth />
+    },
+    {
+      path: '/oauth/linuxdo',
+      element: <LinuxDoOAuth />
     },
     {
       path: '/404',

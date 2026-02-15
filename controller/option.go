@@ -68,6 +68,47 @@ func UpdateOption(c *gin.Context) {
 			})
 			return
 		}
+	case "LinuxDoOAuthEnabled":
+		if option.Value == "true" && (config.LinuxDoClientId == "" || config.LinuxDoClientSecret == "") {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "无法启用 LINUX DO OAuth，请先填入 LINUX DO Client Id 以及 LINUX DO Client Secret！",
+			})
+			return
+		}
+	case "LinuxDoOAuthTrustLevelEnabled":
+		if option.Value == "true" && config.LinuxDoOAuthEnabled == false {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "无法启用 LINUX DO 信用等级限制，请先启用 LINUX DO OAuth ！",
+			})
+			return
+		}
+	case "LinuxDoOAuthDynamicTrustLevel":
+		if option.Value == "true" && config.LinuxDoOAuthTrustLevelEnabled == false {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "无法启用动态信任等级限制，请先启用 LINUX DO 信任等级限制！",
+			})
+			return
+		}
+	case "LinuxDoOAuthLowestTrustLevel":
+		lowestTrustLevel, err := strconv.Atoi(option.Value)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "LINUX DO 信任等级必须为数字",
+			})
+			return
+		}
+		if lowestTrustLevel < config.Basic || lowestTrustLevel > config.Leader {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "LINUX DO 信任等级必须 1~4 之间",
+			})
+			return
+		}
+
 	case "EmailDomainRestrictionEnabled":
 		if option.Value == "true" && len(config.EmailDomainWhitelist) == 0 {
 			c.JSON(http.StatusOK, gin.H{
@@ -89,6 +130,54 @@ func UpdateOption(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
 				"message": "无法启用 Turnstile 校验，请先填入 Turnstile 校验相关配置信息！",
+			})
+			return
+		}
+	case "QuotaForNewUser":
+		value, err := strconv.Atoi(option.Value)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "新用户初始额度必须是整数",
+			})
+			return
+		}
+		if value < 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "新用户初始额度不能为负数",
+			})
+			return
+		}
+	case "QuotaForInviter":
+		value, err := strconv.Atoi(option.Value)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "邀请人额度奖励必须是整数",
+			})
+			return
+		}
+		if value < 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "邀请人额度奖励不能为负数",
+			})
+			return
+		}
+	case "QuotaForInvitee":
+		value, err := strconv.Atoi(option.Value)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "新用户使用邀请码额度奖励必须是整数",
+			})
+			return
+		}
+		if value < 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "新用户使用邀请码额度奖励不能为负数",
 			})
 			return
 		}

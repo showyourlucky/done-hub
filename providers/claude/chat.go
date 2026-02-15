@@ -4,6 +4,7 @@ import (
 	"done-hub/common"
 	"done-hub/common/config"
 	"done-hub/common/image"
+	"done-hub/common/model_utils"
 	"done-hub/common/requester"
 	"done-hub/common/utils"
 	"done-hub/providers/base"
@@ -15,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream"
+	"github.com/gin-gonic/gin"
 )
 
 const (
@@ -28,6 +30,7 @@ type ClaudeStreamHandler struct {
 	Request     *types.ChatCompletionRequest
 	StreamTolls int
 	Prefix      string
+	Context     *gin.Context // 添加 Context 用于获取响应模型名称
 }
 
 func (p *ClaudeProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
@@ -76,6 +79,7 @@ func (p *ClaudeProvider) CreateChatCompletionStream(request *types.ChatCompletio
 		Usage:   p.Usage,
 		Request: request,
 		Prefix:  `data: {"type"`,
+		Context: p.Context, // 传递 Context
 	}
 
 	eventstream.NewDecoder()
@@ -100,18 +104,19 @@ func (p *ClaudeProvider) getChatRequest(claudeRequest *ClaudeRequest) (*http.Req
 		headers["Accept"] = "text/event-stream"
 	}
 
-	if strings.HasPrefix(claudeRequest.Model, "claude-3-5-sonnet") {
-		headers["anthropic-beta"] = "max-tokens-3-5-sonnet-2024-07-15"
+	// 只在用户没有自定义 anthropic-beta 时才设置默认值
+	if _, exists := headers["anthropic-beta"]; !exists {
+		if model_utils.HasPrefixCaseInsensitive(claudeRequest.Model, "claude-3-5-sonnet") {
+			headers["anthropic-beta"] = "max-tokens-3-5-sonnet-2024-07-15"
+		} else if model_utils.HasPrefixCaseInsensitive(claudeRequest.Model, "claude-3-7-sonnet") {
+			headers["anthropic-beta"] = "output-128k-2025-02-19"
+		}
 	}
 
-	if strings.HasPrefix(claudeRequest.Model, "claude-3-7-sonnet") {
-		headers["anthropic-beta"] = "output-128k-2025-02-19"
-	}
-
-	// 创建请求
-	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(claudeRequest), p.Requester.WithHeader(headers))
-	if err != nil {
-		return nil, common.ErrorWrapperLocal(err, "new_request_failed", http.StatusInternalServerError)
+	// 使用BaseProvider的统一方法创建请求，支持额外参数处理
+	req, errWithCode := p.NewRequestWithCustomParams(http.MethodPost, fullRequestURL, claudeRequest, headers, claudeRequest.Model)
+	if errWithCode != nil {
+		return nil, errWithCode
 	}
 
 	return req, nil
@@ -127,6 +132,7 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*ClaudeRequest
 		Temperature:   request.Temperature,
 		TopP:          request.TopP,
 		Stream:        request.Stream,
+		Metadata:      nil,
 	}
 
 	if request.Stop != nil {
@@ -141,17 +147,27 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*ClaudeRequest
 		}
 	}
 
+	// 处理 system 字段（支持 cache_control）
 	systemMessage := ""
 	mgsLen := len(request.Messages) - 1
 	isThink := request.OneOtherArg == "thinking" || request.Reasoning != nil
 
+	// 如果请求中已经有 system 字段（如数组格式带 cache_control），直接使用
+	if request.System != nil {
+		claudeRequest.System = request.System
+	}
+
+	// 处理 messages
 	for index, msg := range request.Messages {
 		if isThink && index == mgsLen && (msg.Role == types.ChatMessageRoleAssistant || msg.Role == types.ChatMessageRoleSystem) {
 			msg.Role = types.ChatMessageRoleUser
 		}
 
 		if msg.Role == types.ChatMessageRoleSystem {
-			systemMessage += msg.StringContent()
+			// 如果没有预设的 system 字段，从 messages 中提取
+			if request.System == nil {
+				systemMessage += msg.StringContent()
+			}
 			continue
 		}
 		messageContent, err := convertMessageContent(&msg)
@@ -163,7 +179,8 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*ClaudeRequest
 		}
 	}
 
-	if systemMessage != "" {
+	// 如果没有预设的 system 字段，且从 messages 中提取到了 system message
+	if request.System == nil && systemMessage != "" {
 		claudeRequest.System = systemMessage
 	}
 
@@ -295,10 +312,15 @@ func convertMessageContent(msg *types.ChatCompletionMessage) (*Message, error) {
 	openaiContent := msg.ParseContent()
 	for _, part := range openaiContent {
 		if part.Type == types.ContentTypeText {
-			content = append(content, MessageContent{
+			msgContent := MessageContent{
 				Type: "text",
 				Text: part.Text,
-			})
+			}
+			// 传递 cache_control 字段
+			if msg.CacheControl != nil {
+				msgContent.CacheControl = msg.CacheControl
+			}
+			content = append(content, msgContent)
 			continue
 		}
 		if part.Type == types.ContentTypeImageURL {
@@ -401,12 +423,15 @@ func ConvertToChatOpenai(provider base.ProviderInterface, response *ClaudeRespon
 		})
 	}
 
+	// 获取响应中应该使用的模型名称
+	responseModel := provider.GetResponseModelName(request.Model)
+
 	openaiResponse = &types.ChatCompletionResponse{
 		ID:      response.Id,
 		Object:  "chat.completion",
 		Created: utils.GetTimestamp(),
 		Choices: choices,
-		Model:   request.Model,
+		Model:   responseModel,
 		Usage: &types.Usage{
 			CompletionTokens: 0,
 			PromptTokens:     0,
@@ -546,11 +571,17 @@ func (h *ClaudeStreamHandler) convertToOpenaiStream(claudeResponse *ClaudeStream
 	if finishReason != "" {
 		choice.FinishReason = &finishReason
 	}
+	// 获取响应中应该使用的模型名称
+	responseModel := h.Request.Model
+	if h.Context != nil {
+		responseModel = base.GetResponseModelNameFromContext(h.Context, h.Request.Model)
+	}
+
 	chatCompletion := types.ChatCompletionStreamResponse{
 		ID:      fmt.Sprintf("chatcmpl-%s", utils.GetUUID()),
 		Object:  "chat.completion.chunk",
 		Created: utils.GetTimestamp(),
-		Model:   h.Request.Model,
+		Model:   responseModel,
 		Choices: []types.ChatCompletionStreamChoice{choice},
 	}
 

@@ -77,6 +77,22 @@ func (p *Pricing) Init() error {
 		return nil
 	}
 
+	modelInfos, err := GetAllModelInfo()
+	if err == nil {
+		modelInfoMap := make(map[string]*ModelInfoResponse)
+		for _, info := range modelInfos {
+			modelInfoMap[info.Model] = info.ToResponse()
+		}
+
+		for _, price := range prices {
+			if info, ok := modelInfoMap[price.Model]; ok {
+				price.ModelInfo = info
+			}
+		}
+	} else {
+		logger.SysError("Failed to fetch model infos: " + err.Error())
+	}
+
 	newPrices := make(map[string]*Price)
 	newMatch := make(map[string]bool)
 
@@ -112,7 +128,27 @@ func (p *Pricing) GetPrice(modelName string) *Price {
 		return price
 	}
 
-	matchModel := utils.GetModelsWithMatch(&p.Match, modelName)
+	// 如果启用了大小写不敏感匹配，先尝试大小写不敏感的精确匹配
+	if config.ModelNameCaseInsensitiveEnabled {
+		modelNameLower := strings.ToLower(modelName)
+		for existingModel, price := range p.Prices {
+			if strings.ToLower(existingModel) == modelNameLower {
+				return price
+			}
+		}
+	}
+
+	// 尝试通配符匹配
+	var matchModel string
+	if config.ModelNameCaseInsensitiveEnabled {
+		matchModel = utils.GetModelsWithMatchCaseInsensitive(&p.Match, modelName)
+		if matchModel == "" {
+			matchModel = utils.GetModelsWithMatch(&p.Match, modelName)
+		}
+	} else {
+		matchModel = utils.GetModelsWithMatch(&p.Match, modelName)
+	}
+
 	if price, ok := p.Prices[matchModel]; ok {
 		return price
 	}

@@ -1,20 +1,22 @@
-import { Icon } from '@iconify/react';
+import { Icon } from '@iconify/react'
 
 const icons = {
-  IconSitemap: () => <Icon width={20} icon="ph:open-ai-logo-duotone" />,
-  IconBasket: () => <Icon width={20} icon="solar:shop-bold-duotone" />,
-  IconKey: () => <Icon width={20} icon="solar:key-bold-duotone" />,
-  IconUser: () => <Icon width={20} icon="solar:user-bold-duotone" />,
-  IconUserScan: () => <Icon width={20} icon="solar:user-id-bold-duotone" />,
-  IconReceipt2: () => <Icon width={20} icon="solar:document-bold-duotone" />,
-  IconSettingsCog: () => <Icon width={20} icon="solar:settings-bold-duotone" />,
-  IconBrandTelegram: () => <Icon width={20} icon="solar:plain-bold-duotone" />,
-  IconCoin: () => <Icon width={20} icon="solar:dollar-minimalistic-bold-duotone" />,
-  IconBrandPaypal: () => <Icon width={20} icon="solar:wallet-money-bold-duotone" />,
-  IconCoins: () => <Icon width={20} icon="solar:hand-money-bold-duotone" />,
-  IconUsers: () => <Icon width={20} icon="solar:users-group-rounded-bold-duotone" />,
-  IconModel: () => <Icon width={20} icon="mingcute:ai-fill" />
-};
+  IconSitemap: () => <Icon width={20} icon="ph:open-ai-logo-duotone"/>,
+  IconBasket: () => <Icon width={20} icon="solar:shop-bold-duotone"/>,
+  IconKey: () => <Icon width={20} icon="solar:key-bold-duotone"/>,
+  IconUser: () => <Icon width={20} icon="solar:user-bold-duotone"/>,
+  IconUserScan: () => <Icon width={20} icon="solar:user-id-bold-duotone"/>,
+  IconReceipt2: () => <Icon width={20} icon="solar:document-bold-duotone"/>,
+  IconSettingsCog: () => <Icon width={20} icon="solar:settings-bold-duotone"/>,
+  IconBrandTelegram: () => <Icon width={20} icon="solar:plain-bold-duotone"/>,
+  IconCoin: () => <Icon width={20} icon="solar:dollar-minimalistic-bold-duotone"/>,
+  IconBrandPaypal: () => <Icon width={20} icon="solar:wallet-money-bold-duotone"/>,
+  IconCoins: () => <Icon width={20} icon="solar:hand-money-bold-duotone"/>,
+  IconUsers: () => <Icon width={20} icon="solar:users-group-rounded-bold-duotone"/>,
+  IconModel: () => <Icon width={20} icon="mingcute:ai-fill"/>,
+  IconTicket: () => <Icon width={20} icon="solar:ticket-bold-duotone"/>,
+  IconInfo: () => <Icon width={20} icon="solar:info-circle-bold-duotone"/>
+}
 
 const Setting = {
   id: 'setting',
@@ -65,20 +67,29 @@ const Setting = {
           isAdmin: true
         },
         {
-          id: 'telegram',
-          title: 'Telegram Bot',
-          type: 'item',
-          url: '/panel/telegram',
-          icon: icons.IconBrandTelegram,
-          breadcrumbs: false,
-          isAdmin: true
-        },
-        {
           id: 'model_ownedby',
           title: '模型归属',
           type: 'item',
           url: '/panel/model_ownedby',
           icon: icons.IconModel,
+          breadcrumbs: false,
+          isAdmin: true
+        },
+        {
+          id: 'model_info',
+          title: '模型详情',
+          type: 'item',
+          url: '/panel/model_info',
+          icon: icons.IconInfo,
+          breadcrumbs: false,
+          isAdmin: true
+        },
+        {
+          id: 'telegram',
+          title: 'Telegram Bot',
+          type: 'item',
+          url: '/panel/telegram',
+          icon: icons.IconBrandTelegram,
           breadcrumbs: false,
           isAdmin: true
         }
@@ -141,6 +152,6 @@ const Setting = {
       isAdmin: true
     }
   ]
-};
+}
 
-export default Setting;
+export default Setting
